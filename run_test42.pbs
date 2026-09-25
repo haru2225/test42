@@ -12,12 +12,12 @@ nrep="${NREP:-5}"
 
 if [[ -n "${DATASET_PATH:-}" ]]; then
     dataset="$DATASET_PATH"
-elif [[ "$stage" == train ]]; then
+elif [[ "$stage" == train || "$stage" == generate || "$stage" == check ]]; then
     dataset="$work_dir/examples/crystal"
 else
     dataset="$work_dir/input/dataset"
 fi
-train_dir="${TRAIN_DIR:-$work_dir/results/train}"
+train_dir="${TRAIN_DIR:-$work_dir/results/egnn_train}"
 
 # --- LAMMPS stage: (re)generate the crystal NPT trajectories, if not
 # already present. Not needed for the bundled examples/crystal dataset
@@ -59,6 +59,14 @@ sif="${SIF_IMAGE:-$work_dir/test42.sif}"
 bind_args=(--bind "$work_dir:$work_dir")
 if [[ -n "${EXTRA_BIND:-}" ]]; then bind_args+=(--bind "$EXTRA_BIND"); fi
 
+# Verify the bound source tree and GPU runtime before a long training job.
+if [[ "$stage" == check ]]; then
+    "$runtime" exec --nv "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python "$work_dir/check_runtime.py" --dataset "$dataset"
+    exec "$runtime" exec "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python -m pytest -q "$work_dir/test_test42.py"
+fi
+
 run_prepare() {
     if [[ -s "$dataset/metadata.json" ]]; then
         echo "[prepare] dataset already present at $dataset, skipping" >&2
@@ -85,7 +93,7 @@ case "$stage" in
         ;;
     train) stage_run=train ;;
     generate) stage_run=generate ;;
-    *) echo 'STAGE must be full, lammps, prepare, train or generate' >&2; exit 2 ;;
+    *) echo 'STAGE must be check, full, lammps, prepare, train or generate' >&2; exit 2 ;;
 esac
 
 case "$stage_run" in
@@ -93,6 +101,7 @@ case "$stage_run" in
         args=(train --dataset "$dataset" --output "$train_dir"
               --updates "${UPDATES:-30000}" --batch-size "${BATCH_SIZE:-8}"
               --width "${WIDTH:-128}" --layers "${LAYERS:-5}"
+              --bloch-shells "${BLOCH_SHELLS:-1}"
               --cutoff "${CUTOFF:-6.0}" --sigma-min "${SIGMA_MIN:-0.03}"
               --learning-rate "${LEARNING_RATE:-0.0002}" --log-every "${LOG_EVERY:-100}")
         # Unset: sigma-max is auto-computed from the dataset's own cell size
@@ -103,7 +112,7 @@ case "$stage_run" in
         ;;
     generate)
         args=(generate --checkpoint "${CHECKPOINT_PATH:-$train_dir/checkpoint.pt}"
-              --steps "${STEPS:-1000}" --output "${GENERATED_DIR:-$work_dir/results/seed${SEED:-1337}}")
+              --steps "${STEPS:-1000}" --output "${GENERATED_DIR:-$work_dir/results/egnn_seed${SEED:-1337}}")
         if [[ -n "${FRAME:-}" ]]; then args+=(--frame "$FRAME"); fi
         ;;
 esac

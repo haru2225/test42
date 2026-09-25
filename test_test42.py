@@ -141,42 +141,83 @@ def test_wrapped_score_matches_image_density_derivative():
         torch.testing.assert_close(t.wrapped_target(pos + 2 * box, clean, box, sigma), actual)
 
 
-def test_equivariance_permutation_and_conditions():
+def test_periodicity_translation_permutation_and_conditions():
     torch.manual_seed(42)
-    model = t.Score(width=8, layers=2, cutoff=4.)
-    pos = torch.tensor([[1., 1., 1.], [2., 1., 1.], [1.5, 2., 1.4], [1., 1., 2.3]])
-    types = torch.tensor([1, 0, 0, 1])
-    box = [12., 12., 12.]
-    edges = t.graph(pos, box, 4.)
-    pred = model(types, edges, .2, box)
-    rotation, _ = torch.linalg.qr(torch.randn(3, 3))
-    rotated_edges = (edges[0], edges[1], edges[2] @ rotation.T)
-    torch.testing.assert_close(model(types, rotated_edges, .2, box), pred @ rotation.T, atol=1e-6, rtol=1e-5)
+    model = t.Score(width=8, layers=2, cutoff=4.).double()
+    pos = torch.tensor([[1., 1., 1.], [2., 1., 1.], [1.5, 2., 1.4], [1., 1., 2.3]], dtype=torch.float64)
+    original = pos.clone()
+    types = torch.ones(4, dtype=torch.long)
+    box = [12., 13., 14.]
+    def predict(x, sigma=.2):
+        return model(types, x, t.graph(x, box, 4.), sigma, box)
+    pred = predict(pos)
     perm = torch.tensor([2, 0, 3, 1])
-    torch.testing.assert_close(model(types[perm], t.graph(pos[perm], box, 4.), .2, box), pred[perm])
-    torch.testing.assert_close(model(types, t.graph((pos + 11.) % 12., box, 4.), .2, box), pred)
-    assert not torch.allclose(model(types, edges, .8, box), pred)
+    torch.testing.assert_close(predict(pos[perm]), pred[perm])
+    shifted = (pos + pos.new_tensor([11., 7., 3.])) % pos.new_tensor(box)
+    torch.testing.assert_close(predict(shifted), pred, atol=1e-12, rtol=1e-8)
+    torch.testing.assert_close(predict(pos + pos.new_tensor(box) * 2), pred, atol=1e-12, rtol=1e-8)
+    assert not torch.allclose(predict(pos, .8), pred)
     pred.square().sum().backward()
-    assert model.species.weight.grad.abs().sum() > 0
+    assert model.egnn.embedding_in.weight.grad.abs().sum() > 0
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    torch.testing.assert_close(pos, original)
     with pytest.raises(ValueError, match="half"):
         t.graph(pos, box, 6.)
 
 
-def test_short_fit_reduces_fixed_denoising_loss():
+def test_projection_is_periodic_tangent_with_cartesian_units():
+    model = t.Score(width=8, layers=1).double()
+    box = torch.tensor([12., 13., 14.], dtype=torch.float64)
+    pos = torch.tensor([[1., 2., 3.], [3., 4., 5.]], dtype=torch.float64, requires_grad=True)
+    z = model.uplift(pos / box)
+    fixed = torch.randn_like(z)
+    derivative = torch.autograd.grad((z * fixed).sum(), pos)[0]
+    projected = torch.einsum("ni,aij,nj->na", z, model.gamma, fixed) / box
+    torch.testing.assert_close(derivative, -2 * np.pi * projected)
+    torch.testing.assert_close(torch.einsum("ni,aij,nj->na", z, model.gamma, z), torch.zeros_like(pos))
+
+
+def test_empty_graph_forward_backward():
+    model = t.Score(width=8, layers=2)
+    pos = torch.tensor([[1., 1., 1.], [7., 7., 7.]])
+    out = model(torch.ones(2, dtype=torch.long), pos, t.graph(pos, [14.] * 3, 1.), .2, [14.] * 3)
+    assert torch.isfinite(out).all()
+    out.square().sum().backward()
+
+
+def test_short_fit_reduces_radial_denoising_loss():
     torch.manual_seed(10)
     model = t.Score(width=16, layers=2, cutoff=4.)
     optimizer = torch.optim.Adam(model.parameters(), lr=.003)
-    clean = torch.tensor([[5., 5., 5.], [6.5, 5., 5.], [5., 6.5, 5.]])
-    types = torch.tensor([1, 0, 0])
+    clean = 4 + torch.rand(8, 3) * 2
+    types = torch.ones(8, dtype=torch.long)
     sigma, box = .1, [12.] * 3
-    noisy = clean + sigma * torch.randn_like(clean)
+    # A known relative radial displacement tests learnability without requiring
+    # recovery of a fixed absolute origin or arbitrary labeled-atom identities.
+    noisy = clean + sigma * .4 * (clean - clean.mean(0))
     edges = t.graph(noisy, box, 4.)
     target = t.wrapped_target(noisy, clean, box, sigma)
     losses = []
     for _ in range(60):
         optimizer.zero_grad()
-        loss = (model(types, edges, sigma, box) - target).square().mean()
+        loss = (model(types, noisy, edges, sigma, box) - target).square().mean()
         losses.append(float(loss.detach()))
         loss.backward()
         optimizer.step()
     assert losses[-1] < losses[0] * .65
+
+
+def test_old_checkpoint_rejected(tmp_path):
+    path = tmp_path / "old.pt"
+    torch.save(dict(format=t.FORMAT), path)
+    args = t.parser().parse_args(["generate", "--checkpoint", str(path),
+        "--output", str(tmp_path / "gen"), "--device", "cpu"])
+    with pytest.raises(ValueError, match="retrain"):
+        t.generate(args)
+
+
+def test_bundled_legacy_dataset_loads():
+    from pathlib import Path
+    arrays, meta = t.load_dataset(Path(__file__).parent / "examples" / "crystal")
+    assert arrays.shape == (62, 64, 3)
+    assert meta["format"] == "test42-crystal-single-phase-v1"
