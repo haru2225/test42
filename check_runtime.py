@@ -17,10 +17,9 @@ def main():
     torch.manual_seed(42)
     pos = torch.tensor(frames[0].copy(), device="cuda")
     box = meta["lengths"][0]
-    cutoff = min(6., .49 * min(box))
-    model = Score(width=16, layers=2, cutoff=cutoff).cuda()
+    model = Score(width=32, layers=4, hidden_layers=1).cuda()
     prediction = model(torch.ones(len(pos), device="cuda", dtype=torch.long),
-                       pos, graph(pos, box, cutoff), .3, box)
+                       pos, graph(pos, box), .3, box)
     prediction.square().mean().backward()
     if not torch.isfinite(prediction).all():
         raise RuntimeError("Non-finite GPU prediction")

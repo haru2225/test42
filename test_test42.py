@@ -135,7 +135,7 @@ def test_wrapped_score_matches_image_density_derivative():
     for sigma in (0.1, 1.99, 2., 3., 12.):
         images = pos[..., None] + torch.arange(-12, 13) * box[:, None]
         logdensity = torch.logsumexp(-images.square() / (2 * sigma**2), -1).sum()
-        expected = -sigma * torch.autograd.grad(logdensity, pos, retain_graph=True)[0]
+        expected = sigma * torch.autograd.grad(logdensity, pos, retain_graph=True)[0]
         actual = t.wrapped_target(pos, clean, box, sigma)
         torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-6)
         torch.testing.assert_close(t.wrapped_target(pos + 2 * box, clean, box, sigma), actual)
@@ -149,7 +149,7 @@ def test_periodicity_translation_permutation_and_conditions():
     types = torch.ones(4, dtype=torch.long)
     box = [12., 13., 14.]
     def predict(x, sigma=.2):
-        return model(types, x, t.graph(x, box, 4.), sigma, box)
+        return model(types, x, t.graph(x, box), sigma, box)
     pred = predict(pos)
     perm = torch.tensor([2, 0, 3, 1])
     torch.testing.assert_close(predict(pos[perm]), pred[perm])
@@ -161,8 +161,6 @@ def test_periodicity_translation_permutation_and_conditions():
     assert model.egnn.embedding_in.weight.grad.abs().sum() > 0
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     torch.testing.assert_close(pos, original)
-    with pytest.raises(ValueError, match="half"):
-        t.graph(pos, box, 6.)
 
 
 def test_projection_is_periodic_tangent_with_cartesian_units():
@@ -177,10 +175,10 @@ def test_projection_is_periodic_tangent_with_cartesian_units():
     torch.testing.assert_close(torch.einsum("ni,aij,nj->na", z, model.gamma, z), torch.zeros_like(pos))
 
 
-def test_empty_graph_forward_backward():
+def test_fully_connected_graph_forward_backward():
     model = t.Score(width=8, layers=2)
     pos = torch.tensor([[1., 1., 1.], [7., 7., 7.]])
-    out = model(torch.ones(2, dtype=torch.long), pos, t.graph(pos, [14.] * 3, 1.), .2, [14.] * 3)
+    out = model(torch.ones(2, dtype=torch.long), pos, t.graph(pos, [14.] * 3), .2, [14.] * 3)
     assert torch.isfinite(out).all()
     out.square().sum().backward()
 
@@ -195,7 +193,7 @@ def test_short_fit_reduces_radial_denoising_loss():
     # A known relative radial displacement tests learnability without requiring
     # recovery of a fixed absolute origin or arbitrary labeled-atom identities.
     noisy = clean + sigma * .4 * (clean - clean.mean(0))
-    edges = t.graph(noisy, box, 4.)
+    edges = t.graph(noisy, box)
     target = t.wrapped_target(noisy, clean, box, sigma)
     losses = []
     for _ in range(60):

@@ -17,7 +17,7 @@ elif [[ "$stage" == train || "$stage" == generate || "$stage" == check ]]; then
 else
     dataset="$work_dir/input/dataset"
 fi
-train_dir="${TRAIN_DIR:-$work_dir/results/egnn_train}"
+train_dir="${TRAIN_DIR:-$work_dir/results/egnn_source_train}"
 
 # --- LAMMPS stage: (re)generate the crystal NPT trajectories, if not
 # already present. Not needed for the bundled examples/crystal dataset
@@ -100,9 +100,9 @@ case "$stage_run" in
     train)
         args=(train --dataset "$dataset" --output "$train_dir"
               --updates "${UPDATES:-30000}" --batch-size "${BATCH_SIZE:-8}"
-              --width "${WIDTH:-128}" --layers "${LAYERS:-5}"
-              --bloch-shells "${BLOCH_SHELLS:-1}"
-              --cutoff "${CUTOFF:-6.0}" --sigma-min "${SIGMA_MIN:-0.03}"
+              --width "${WIDTH:-256}" --layers "${LAYERS:-4}"
+              --hidden-layers "${HIDDEN_LAYERS:-4}"
+              --sigma-min "${SIGMA_MIN:-0.03}"
               --learning-rate "${LEARNING_RATE:-0.0002}" --log-every "${LOG_EVERY:-100}")
         # Unset: sigma-max is auto-computed from the dataset's own cell size
         # (~13.5 A here, crystal-only) -- much smaller than test40's shared
@@ -112,7 +112,7 @@ case "$stage_run" in
         ;;
     generate)
         args=(generate --checkpoint "${CHECKPOINT_PATH:-$train_dir/checkpoint.pt}"
-              --steps "${STEPS:-1000}" --output "${GENERATED_DIR:-$work_dir/results/egnn_seed${SEED:-1337}}")
+              --steps "${STEPS:-1000}" --output "${GENERATED_DIR:-$work_dir/results/egnn_source_seed${SEED:-1337}}")
         if [[ -n "${FRAME:-}" ]]; then args+=(--frame "$FRAME"); fi
         ;;
 esac

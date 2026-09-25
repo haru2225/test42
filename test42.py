@@ -8,9 +8,9 @@ snapshots of one fixed beta-cristobalite lattice, same topology throughout
 glass-style network diversity or shared-model phase-conditioning to
 confound the diagnosis).
 
-The current Score network adapts the periodic Bloch-wave EGNN from
-mila-iqia/diffusion_for_multi_scale_molecular_dynamics (see egnn_vendor.py).
-This is an architecture experiment; improved denoising is not established.
+The Score network now follows the EGNN implementation and score-network
+wrapper from mila-iqia/diffusion_for_multi_scale_molecular_dynamics
+(see egnn_vendor.py). Improved denoising is not established.
 The periodic uplift preserves global translation invariance after projection
 and does not supply an absolute lattice-origin reference.
 
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import itertools
 import json
 import math
 import signal
@@ -39,7 +38,7 @@ from torch import nn
 from egnn_vendor import EGNN
 
 FORMAT = "test42-crystal-single-phase-v2"
-CHECKPOINT_FORMAT = "test42-crystal-bloch-egnn-v3"
+CHECKPOINT_FORMAT = "test42-crystal-source-egnn-v4"
 SI_MASS, O_MASS = 28.0855, 15.9994
 BEAD_MASS = SI_MASS + 2 * O_MASS
 STOP = False
@@ -209,87 +208,82 @@ def load_dataset(path):
     return np.load(file, mmap_mode="r"), meta
 
 
-def graph(pos, lengths, cutoff):
-    """Rebuild the actual noisy graph, identically in training and sampling."""
-    box = np.asarray(lengths, dtype=float)
-    if cutoff >= box.min() / 2:
-        raise ValueError("cutoff must be strictly smaller than half the shortest cell side; replicate the reference")
-    i, j, disp = primitive_neighbor_list("ijD", pbc=(True, True, True), cell=np.diag(box),
-        positions=pos.detach().cpu().numpy(), cutoff=cutoff, self_interaction=False)
-    return (torch.as_tensor(i, device=pos.device), torch.as_tensor(j, device=pos.device),
-            torch.as_tensor(disp, dtype=pos.dtype, device=pos.device))
+def graph(pos, lengths, cutoff=None):
+    """Source EGNN default: directed fully connected graph and minimum-image distances."""
+    n_atoms = pos.shape[0]
+    indices = torch.arange(n_atoms, device=pos.device)
+    src = indices.repeat_interleave(n_atoms)
+    dst = indices.repeat(n_atoms)
+    keep = src != dst
+    src, dst = src[keep], dst[keep]
+    box = pos.new_tensor(lengths)
+    delta = pos[dst] - pos[src]
+    delta = delta - torch.round(delta / box) * box
+    return src, dst, delta
 
 
-def bloch_wave_vectors(shells=1, spatial_dimension=3):
-    """Integer reciprocal-lattice ("Bloch wave") vectors within `shells`,
-    half-space deduped by inversion (K and -K give redundant cos/sin pairs).
-
-    Simplified, orthorhombic-only version of mila-iqia/diffusion_for_multi_
-    scale_molecular_dynamics's cubic-point-group shell generator (see
-    egnn_vendor.py's docstring for provenance): that version sorts vectors
-    into symmetric shells under the full cubic point group, which this
-    system's cell (an orthorhombic supercell, not necessarily cubic) does
-    not have -- a plain integer grid within `shells` needs no point group.
-    """
-    if shells < 1:
-        raise ValueError("bloch_shells must be positive")
-    shifts = range(-shells, shells + 1)
-    seen, half = set(), []
-    for v in itertools.product(shifts, repeat=spatial_dimension):
-        if v == (0,) * spatial_dimension or v in seen:
-            continue
-        half.append(v)
-        seen.add(v)
-        seen.add(tuple(-c for c in v))
-    return torch.tensor(half, dtype=torch.float32)
+def source_bloch_wave_vectors():
+    """The three positive reciprocal vectors in the source's first cubic shell."""
+    return torch.eye(3, dtype=torch.float32)
 
 
 class Score(nn.Module):
-    """Periodic EGNN predicting the training target -sigma * score in Cartesian units.
+    """Source EGNNScoreNetwork wrapper adapted to one SiO4 bead species.
 
-    Interleaved cos/sin coordinates and block-diagonal Gamma matrices follow
-    the source wrapper. Global translations rotate each embedding pair;
-    EGNN and the bilinear projection preserve this symmetry. The finite
-    reciprocal grid does not impose arbitrary rotations at a fixed box.
+    Matches the source's first cubic Bloch shell, sigma + atom-type one-hot
+    features, fully connected minimum-image graph, Gamma projection, and
+    configuration-template EGNN widths/depth. Output uses the source's
+    sigma-normalized score convention.
     """
-    def __init__(self, width=128, layers=5, cutoff=6.0, bloch_shells=1, spatial_dimension=3):
+    def __init__(self, width=256, layers=4, hidden_layers=4, cutoff=None, bloch_shells=1):
         super().__init__()
-        self.cutoff = cutoff
-        self.spatial_dimension = spatial_dimension
-        bloch = bloch_wave_vectors(bloch_shells, spatial_dimension)
-        self.register_buffer("bloch_vectors", bloch)
-        rotation_generator = torch.tensor([[0., -1.], [1., 0.]])
-        gammas = [torch.block_diag(*[k[axis] * rotation_generator for k in bloch])
-                  for axis in range(spatial_dimension)]
-        self.register_buffer("gamma", torch.stack(gammas))  # [spatial_dimension, uplifted_dim, uplifted_dim]
+        if bloch_shells != 1:
+            raise ValueError("Source-compatible EGNN uses the first cubic Bloch shell")
+        self.spatial_dimension = 3
+        self.num_atom_types = 1
+        self.register_buffer("bloch_vectors", source_bloch_wave_vectors())
+        generator = torch.tensor([[0., -1.], [1., 0.]])
+        self.register_buffer("gamma", torch.stack([
+            torch.block_diag(*[k[axis] * generator for k in self.bloch_vectors])
+            for axis in range(3)
+        ]))
+        # one real species + MASK class + diffusion sigma
         self.egnn = EGNN(
-            input_size=1, output_size=width,  # node input: log(sigma) only (one bead species here)
-            message_n_hidden_dimensions=1, message_hidden_dimensions_size=width,
-            node_n_hidden_dimensions=1, node_hidden_dimensions_size=width,
-            coordinate_n_hidden_dimensions=1, coordinate_hidden_dimensions_size=width,
-            n_layers=layers,
+            input_size=self.num_atom_types + 2,
+            num_classes=self.num_atom_types + 1,
+            message_n_hidden_dimensions=hidden_layers,
+            message_hidden_dimensions_size=width,
+            node_n_hidden_dimensions=hidden_layers,
+            node_hidden_dimensions_size=width,
+            coordinate_n_hidden_dimensions=hidden_layers,
+            coordinate_hidden_dimensions_size=width,
+            residual=True, attention=False, normalize=False, tanh=False,
+            coords_agg="mean", message_agg="mean", n_layers=layers,
         )
 
     def uplift(self, fractional):
-        two_pi_x = 2 * math.pi * fractional
-        kr = torch.einsum("kd,nd->nk", self.bloch_vectors.to(two_pi_x), two_pi_x)
+        kr = torch.einsum("kd,nd->nk", self.bloch_vectors.to(fractional),
+                          2.0 * math.pi * fractional)
         return torch.stack([kr.cos(), kr.sin()], dim=-1).flatten(start_dim=1)
 
     def forward(self, types, pos, edges, sigma, lengths):
-        i, j, disp = edges
-        box = pos.new_tensor(lengths)
-        fractional = (pos / box) % 1.0
+        src, dst, displacement = edges
+        fractional = (pos / pos.new_tensor(lengths)) % 1.0
         z = self.uplift(fractional)
-        h = pos.new_full((len(types), 1), math.log(sigma))
-        edge_index = torch.stack([i.to(pos.dtype), j.to(pos.dtype), disp.norm(dim=-1)], dim=-1)
-        _, z_hat = self.egnn(h, edge_index, z.clone())
-        # Fractional-coordinate covectors transform to Cartesian by 1 / L.
-        # Sign and normalization are learned against wrapped_target (-sigma*score).
-        return torch.einsum("ni,aij,nj->na", z, self.gamma, z_hat) / box
-
+        sigma_features = pos.new_full((len(types), 1), sigma)
+        # test42 has one unmasked bead species; source layout is [sigma, one-hot(type+MASK)].
+        atom_type_features = pos.new_zeros((len(types), self.num_atom_types + 1))
+        atom_type_features[:, 0] = 1.0
+        h = torch.cat([sigma_features, atom_type_features], dim=-1)
+        edge_features = torch.stack([src.to(pos.dtype), dst.to(pos.dtype),
+                                     displacement.norm(dim=-1)], dim=-1)
+        raw = self.egnn(h, edge_features, z.clone())
+        # Source wrapper's projection returns sigma-normalized Cartesian scores;
+        # no division by cell lengths is applied.
+        return torch.einsum("ni,aij,nj->na", z, self.gamma, raw.X)
 
 def wrapped_target(noisy, clean, lengths, sigma):
-    """Exact periodic Gaussian -sigma*score, with convergent image/Fourier sums."""
+    """Exact periodic Gaussian sigma*score, with convergent image/Fourier sums."""
     box = torch.as_tensor(lengths, dtype=noisy.dtype, device=noisy.device)
     delta = (noisy - clean + box / 2) % box - box / 2
     result = torch.empty_like(delta)
@@ -299,14 +293,14 @@ def wrapped_target(noisy, clean, lengths, sigma):
         if sigma / float(side) < 0.2:
             images = d + torch.arange(-2, 3, device=noisy.device) * side
             weights = torch.softmax(-0.5 * (images / sigma).square(), -1)
-            result[:, axis] = (weights * images).sum(-1) / sigma
+            result[:, axis] = -(weights * images).sum(-1) / sigma
         else:
             k = torch.arange(1, 13, dtype=noisy.dtype, device=noisy.device)
             amplitude = torch.exp(-2 * math.pi**2 * k.square() * (sigma / side)**2)
             angle = 2 * math.pi * d * k / side
             density = 1 + 2 * (amplitude * torch.cos(angle)).sum(-1)
             deriv = -(4 * math.pi / side) * (k * amplitude * torch.sin(angle)).sum(-1)
-            result[:, axis] = -sigma * deriv / density.clamp_min(1e-12)
+            result[:, axis] = sigma * deriv / density.clamp_min(1e-12)
     return result
 
 
@@ -323,9 +317,7 @@ def device_for(name):
 def train(args):
     arrays, meta = load_dataset(args.dataset)
     device = device_for(args.device)
-    config = dict(width=args.width, layers=args.layers, cutoff=args.cutoff, bloch_shells=args.bloch_shells)
-    if args.cutoff >= min(min(cell) for cell in meta["lengths"]) / 2:
-        raise ValueError("Replicate input cells or reduce cutoff to below half the shortest side, in every frame")
+    config = dict(width=args.width, layers=args.layers, hidden_layers=args.hidden_layers)
     maximum = max(max(cell) for cell in meta["lengths"])
     sigma_max = args.sigma_max or maximum
     if sigma_max <= args.sigma_min or math.exp(-2 * math.pi**2 * (sigma_max / maximum)**2) > 1e-5:
@@ -363,7 +355,7 @@ def train(args):
         box = clean.new_tensor(lengths)
         noisy = (clean + sigma * torch.randn_like(clean)) % box
         types = torch.tensor(np.asarray(meta["numbers"]) == 14, device=device).long()
-        pred = model(types, noisy, graph(noisy, lengths, args.cutoff), sigma, lengths)
+        pred = model(types, noisy, graph(noisy, lengths), sigma, lengths)
         target = wrapped_target(noisy, clean, box, sigma)
         return (pred - target).square().mean(), target.square().mean()
 
@@ -412,7 +404,7 @@ def train(args):
 def generate(args):
     ck = load_pt(args.checkpoint)
     if ck.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError("A Bloch-EGNN v3 checkpoint is required; retrain older test42 models in a new output directory")
+        raise ValueError("A source-compatible EGNN v4 checkpoint is required; retrain older test42 models in a new output directory")
     device = device_for(args.device)
     config = ck["settings"]["architecture"]
     model = Score(**config).to(device)
@@ -457,8 +449,8 @@ def generate(args):
             return 75
         sigma = float(levels[step])
         dv = float(levels[step]**2 - levels[step + 1]**2)
-        pred = model(types, pos, graph(pos, lengths, config["cutoff"]), sigma, lengths)
-        pos = (pos - dv / sigma * pred + math.sqrt(dv) * torch.randn_like(pos)) % box
+        pred = model(types, pos, graph(pos, lengths), sigma, lengths)
+        pos = (pos + dv / sigma * pred + math.sqrt(dv) * torch.randn_like(pos)) % box
         if not torch.isfinite(pos).all():
             raise RuntimeError("Non-finite sample")
         completed = step + 1
@@ -586,10 +578,10 @@ def parser():
     tr.add_argument("--dataset", type=Path, required=True)
     tr.add_argument("--updates", type=count, default=30000)
     tr.add_argument("--batch-size", type=count, default=8, help="(frame, sigma) samples averaged before each backward")
-    tr.add_argument("--width", type=count, default=128)
-    tr.add_argument("--layers", type=count, default=5)
-    tr.add_argument("--bloch-shells", type=count, default=1, help="Integer reciprocal grid extent (1 gives 13 cos/sin pairs)")
-    tr.add_argument("--cutoff", type=positive, default=6.)
+    tr.add_argument("--width", type=count, default=256)
+    tr.add_argument("--layers", type=count, default=4)
+    tr.add_argument("--hidden-layers", type=count, default=4)
+    tr.add_argument("--cutoff", type=positive, help=argparse.SUPPRESS)
     tr.add_argument("--sigma-min", type=positive, default=0.03)
     tr.add_argument("--sigma-max", type=positive)
     tr.add_argument("--learning-rate", type=positive, default=2e-4)

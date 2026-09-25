@@ -8,33 +8,30 @@ module and `licenses/diffusion_for_multi_scale_molecular_dynamics-MIT.txt`.
 
 ## Architecture and scope
 
-Fractional coordinates are mapped to **interleaved** cos/sin pairs, processed
-by EGNN, and projected through matching 2x2 Gamma blocks. Graph edges carry
-minimum-image Cartesian distances. The projected fractional covector is
-divided by cell lengths and trained against `-sigma * score` in Cartesian
-coordinates, matching the existing sampler and wrapped-Gaussian target.
-One SiO4 bead species is used; node input is log(sigma).
+`egnn_vendor.py` now vendors the upstream `models/egnn.py` implementation
+from `mila-iqia/diffusion_for_multi_scale_molecular_dynamics` (commit noted
+in the module). `test42.py:Score` follows its `EGNNScoreNetwork` wrapper:
+source first cubic Bloch shell (3 reciprocal vectors / 6 coordinates),
+interleaved cos/sin uplift, sigma plus atom-type one-hot node inputs,
+directed fully connected minimum-image graph, matching Gamma projection,
+and sigma-normalized score convention. The SiO4 bead is the sole real atom
+class; the MASK channel is retained for source-compatible input dimensions.
+The architecture defaults match the source EGNN experiment template:
+4 graph layers and 256-wide message/node/coordinate MLPs with four hidden
+MLP layers. `WIDTH`, `LAYERS`, and `HIDDEN_LAYERS` can be overridden.
 
-`--bloch-shells 1` uses the nonzero integer grid [-1,1]^3 modulo inversion:
-13 vectors / 26 embedding dimensions. This differs from the source's first
-complete length shell (3 vectors / 6 dimensions). The grid extent is saved
-in checkpoints and can be set via `BLOCH_SHELLS` in the PBS script.
+The Cartesian `sigma * score` convention is used consistently in the target
+and VE-SDE reverse update. This differs from earlier test42 checkpoints, which
+used the opposite target sign, divided the projection by cell lengths, used a
+13-vector grid and a 6 A cutoff graph. Retrain into `results/egnn_source_train`; old
+checkpoints are rejected. The original source supports fully connected edges
+by default, and this test uses that path. For 64 beads this is 4032 directed
+edges per frame; minimum-image distances are computed from the noisy positions.
 
-This construction **preserves invariance to uniform translation**: translation
-rotates cos/sin pairs, and the final projection cancels that rotation. It
-therefore does not identify an absolute lattice origin or automatically
-resolve denoising ambiguity. It also does not enforce arbitrary continuous
-rotations at a fixed orthorhombic cell. A lower middle-noise validation loss
-or improved generation quality must be established by training experiments.
-
-Prepared v1 (including the bundled crystal data) and v2 datasets remain usable. Checkpoints now use
-`test42-crystal-bloch-egnn-v3`; old architecture/partial-port checkpoints
-must be retrained in a fresh output directory. Training and generation
-resume are supported for new checkpoints.
-
-SiO4 mass-weighted mapping, periodic wrapped-Gaussian targets and VE-SDE
-Euler-Maruyama sampling are retained. This generates structures, not an
-energy model or equilibrium MD trajectory.
+This reproduces the source EGNN wrapper design for the test42 coarse-grained
+single-species task. The dataset, wrapped-Gaussian target implementation,
+training loop, and output structure remain test42-specific, so it is not an
+identical end-to-end reproduction of the paper's atomistic experiments.
 
 ## Data
 
@@ -76,23 +73,23 @@ qsub -P PROJECT_ID -l walltime=00:10:00 -v STAGE=check run_test42.pbs
 qsub -P PROJECT_ID -l walltime=00:10:00 -v UPDATES=2,WIDTH=16,LAYERS=2,BATCH_SIZE=1,TRAIN_DIR=results/egnn_smoke,TIME_BUDGET_HOURS=0.1 run_test42.pbs
 qsub -P PROJECT_ID -l walltime=00:10:00 -v STAGE=generate,STEPS=20,TRAIN_DIR=results/egnn_smoke,GENERATED_DIR=results/egnn_smoke_sample,TIME_BUDGET_HOURS=0.1 run_test42.pbs
 
-# 本学習: 同梱62フレームを使用、results/egnn_train に保存
+# 本学習: 同梱62フレームを使用、results/egnn_source_train に保存
 qsub -P PROJECT_ID run_test42.pbs
 
 # 中断後の再開。同じ幅・層数・ノイズ設定などを使用すること
-qsub -P PROJECT_ID -v RESUME=1,UPDATES=30000 run_test42.pbs
+qsub -P PROJECT_ID -v RESUME=1,UPDATES=30000,WIDTH=256,LAYERS=4,HIDDEN_LAYERS=4 run_test42.pbs
 
-# 本学習の完了後、構造を生成。既定出力: results/egnn_seed1337
+# 本学習の完了後、構造を生成。既定出力: results/egnn_source_seed1337
 qsub -P PROJECT_ID -v STAGE=generate run_test42.pbs
 ```
 
 ジョブは自動的には順番待ちしません。学習ログの完了を確認してから対応する
 生成ジョブを投入してください。途中保存で終了した場合の終了コードは75です。
 短時間確認で生成品質は評価できません。本学習の損失と構造指標を確認してください。
-旧 `results/train` のチェックポイントは再利用できません。
+旧チェックポイント のチェックポイントは再利用できません。
 
 主な環境変数: `TRAIN_DIR`, `GENERATED_DIR`, `DATASET_PATH`, `SIF_IMAGE`,
-`WIDTH`, `LAYERS`, `BLOCH_SHELLS`, `BATCH_SIZE`, `UPDATES`, `SIGMA_MIN`,
+`WIDTH`, `LAYERS`, `HIDDEN_LAYERS`, `BATCH_SIZE`, `UPDATES`, `SIGMA_MIN`,
 `SIGMA_MAX`, `LEARNING_RATE`, `SEED`。外部ディレクトリを使う場合は
 `EXTRA_BIND=/absolute/path:/absolute/path` も指定します。
 walltimeを変更した場合は `WALLTIME_HOURS` または `TIME_BUDGET_HOURS` も合わせます。
@@ -103,7 +100,7 @@ walltimeを変更した場合は `WALLTIME_HOURS` または `TIME_BUDGET_HOURS` 
 ```bash
 singularity exec --bind "$PWD:$PWD" --pwd "$PWD" test42.sif \
   python test42.py evaluate --dataset examples/crystal \
-  --sample results/egnn_seed1337/final.extxyz --output results/egnn_evaluation.json
+  --sample results/egnn_source_seed1337/final.extxyz --output results/egnn_evaluation.json
 ```
 
 ## Local checks
@@ -116,9 +113,5 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-Tests cover periodicity, global translations, atom permutations, projection
-units, empty graphs, backpropagation, a short fit to relative radial
-displacements, and prepare/train/generate/evaluate including exact restart.
-The former three-atom random-target short-fit test did not meet its loss
-threshold with this EGNN; the radial fit checks implementation learnability,
-not recovery of arbitrary denoising targets or crystal-generation quality.
+The test suite covers periodic geometry, permutation behavior, score-target
+conventions, gradients, and the prepare/train/generate/evaluate workflow.
