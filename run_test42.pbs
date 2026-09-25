@@ -95,6 +95,11 @@ case "$stage_run" in
               --width "${WIDTH:-128}" --layers "${LAYERS:-5}"
               --cutoff "${CUTOFF:-6.0}" --sigma-min "${SIGMA_MIN:-0.03}"
               --learning-rate "${LEARNING_RATE:-0.0002}" --log-every "${LOG_EVERY:-100}")
+        # Unset: sigma-max is auto-computed from the dataset's own cell size
+        # (~13.5 A here, crystal-only) -- much smaller than test40's shared
+        # glass+crystal maximum (~36.27 A). Set SIGMA_MAX explicitly to that
+        # value for a same-noise-scale "middle" bin comparison against test40.
+        if [[ -n "${SIGMA_MAX:-}" ]]; then args+=(--sigma-max "$SIGMA_MAX"); fi
         ;;
     generate)
         args=(generate --checkpoint "${CHECKPOINT_PATH:-$train_dir/checkpoint.pt}"
