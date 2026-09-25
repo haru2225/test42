@@ -103,7 +103,8 @@ case "$stage_run" in
               --width "${WIDTH:-256}" --layers "${LAYERS:-4}"
               --hidden-layers "${HIDDEN_LAYERS:-4}"
               --sigma-min "${SIGMA_MIN:-0.03}"
-              --learning-rate "${LEARNING_RATE:-0.0002}" --log-every "${LOG_EVERY:-100}")
+              --learning-rate "${LEARNING_RATE:-0.0002}"
+              --weight-decay "${WEIGHT_DECAY:-5e-8}" --log-every "${LOG_EVERY:-100}")
         # Unset: sigma-max is auto-computed from the dataset's own cell size
         # (~13.5 A here, crystal-only) -- much smaller than test40's shared
         # glass+crystal maximum (~36.27 A). Set SIGMA_MAX explicitly to that

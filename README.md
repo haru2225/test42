@@ -21,10 +21,12 @@ The architecture defaults match the source EGNN experiment template:
 MLP layers. `WIDTH`, `LAYERS`, and `HIDDEN_LAYERS` can be overridden.
 
 The Cartesian `sigma * score` convention is used consistently in the target
-and VE-SDE reverse update. This differs from earlier test42 checkpoints, which
-used the opposite target sign, divided the projection by cell lengths, used a
-13-vector grid and a 6 A cutoff graph. Retrain into `results/egnn_source_train`; old
-checkpoints are rejected. The original source supports fully connected edges
+and VE-SDE reverse update. The optimizer uses AdamW with weight decay
+`5e-8`, matching the source experiment configuration; learning rate remains
+test42’s `2e-4` so the weight-decay comparison changes one setting at a time.
+Earlier test42 checkpoints used the opposite target sign, divided the projection
+by cell lengths, used a 13-vector grid and a 6 A cutoff graph. New runs use
+`results/egnn_source_wd5e8`; older checkpoint formats are rejected. The original source supports fully connected edges
 by default, and this test uses that path. For 64 beads this is 4032 directed
 edges per frame; minimum-image distances are computed from the noisy positions.
 
@@ -73,14 +75,14 @@ qsub -P PROJECT_ID -l walltime=00:10:00 -v STAGE=check run_test42.pbs
 qsub -P PROJECT_ID -l walltime=00:10:00 -v UPDATES=2,WIDTH=16,LAYERS=2,BATCH_SIZE=1,TRAIN_DIR=results/egnn_smoke,TIME_BUDGET_HOURS=0.1 run_test42.pbs
 qsub -P PROJECT_ID -l walltime=00:10:00 -v STAGE=generate,STEPS=20,TRAIN_DIR=results/egnn_smoke,GENERATED_DIR=results/egnn_smoke_sample,TIME_BUDGET_HOURS=0.1 run_test42.pbs
 
-# 本学習: 同梱62フレームを使用、results/egnn_source_train に保存
-qsub -P PROJECT_ID run_test42.pbs
+# 比較用に新しい出力先を指定して学習（weight decay=5e-8）
+qsub -P PROJECT_ID -v TRAIN_DIR=results/egnn_source_wd5e8 run_test42.pbs
 
 # 中断後の再開。同じ幅・層数・ノイズ設定などを使用すること
-qsub -P PROJECT_ID -v RESUME=1,UPDATES=30000,WIDTH=256,LAYERS=4,HIDDEN_LAYERS=4 run_test42.pbs
+qsub -P PROJECT_ID -v RESUME=1,UPDATES=30000,WIDTH=256,LAYERS=4,HIDDEN_LAYERS=4,WEIGHT_DECAY=5e-8,TRAIN_DIR=results/egnn_source_wd5e8 run_test42.pbs
 
-# 本学習の完了後、構造を生成。既定出力: results/egnn_source_seed1337
-qsub -P PROJECT_ID -v STAGE=generate run_test42.pbs
+# 学習完了後に同じcheckpointから生成
+qsub -P PROJECT_ID -v STAGE=generate,TRAIN_DIR=results/egnn_source_wd5e8,GENERATED_DIR=results/egnn_source_wd5e8_sample run_test42.pbs
 ```
 
 ジョブは自動的には順番待ちしません。学習ログの完了を確認してから対応する
@@ -90,7 +92,7 @@ qsub -P PROJECT_ID -v STAGE=generate run_test42.pbs
 
 主な環境変数: `TRAIN_DIR`, `GENERATED_DIR`, `DATASET_PATH`, `SIF_IMAGE`,
 `WIDTH`, `LAYERS`, `HIDDEN_LAYERS`, `BATCH_SIZE`, `UPDATES`, `SIGMA_MIN`,
-`SIGMA_MAX`, `LEARNING_RATE`, `SEED`。外部ディレクトリを使う場合は
+`SIGMA_MAX`, `LEARNING_RATE`, `WEIGHT_DECAY`, `SEED`。外部ディレクトリを使う場合は
 `EXTRA_BIND=/absolute/path:/absolute/path` も指定します。
 walltimeを変更した場合は `WALLTIME_HOURS` または `TIME_BUDGET_HOURS` も合わせます。
 

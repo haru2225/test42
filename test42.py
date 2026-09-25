@@ -38,7 +38,7 @@ from torch import nn
 from egnn_vendor import EGNN
 
 FORMAT = "test42-crystal-single-phase-v2"
-CHECKPOINT_FORMAT = "test42-crystal-source-egnn-v4"
+CHECKPOINT_FORMAT = "test42-crystal-source-egnn-v5"
 SI_MASS, O_MASS = 28.0855, 15.9994
 BEAD_MASS = SI_MASS + 2 * O_MASS
 STOP = False
@@ -324,12 +324,15 @@ def train(args):
         raise ValueError("sigma-max must exceed sigma-min and be large enough for a uniform terminal distribution")
     settings = dict(dataset_sha256=digest(args.dataset / "metadata.json"), architecture=config,
         sigma_min=args.sigma_min, sigma_max=sigma_max, learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         batch_size=args.batch_size, seed=args.seed, device=args.device)
     output = output_dir(args.output, args.resume)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     model = Score(**config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
     completed, history = 0, []
     if args.resume:
         ck = load_pt(output / "checkpoint.pt")
@@ -404,7 +407,7 @@ def train(args):
 def generate(args):
     ck = load_pt(args.checkpoint)
     if ck.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError("A source-compatible EGNN v4 checkpoint is required; retrain older test42 models in a new output directory")
+        raise ValueError("A source-compatible EGNN v5 checkpoint is required; start a new run for changed optimizer settings")
     device = device_for(args.device)
     config = ck["settings"]["architecture"]
     model = Score(**config).to(device)
@@ -585,6 +588,7 @@ def parser():
     tr.add_argument("--sigma-min", type=positive, default=0.03)
     tr.add_argument("--sigma-max", type=positive)
     tr.add_argument("--learning-rate", type=positive, default=2e-4)
+    tr.add_argument("--weight-decay", type=positive, default=5e-8)
     tr.add_argument("--log-every", type=count, default=100)
     gen = sub.add_parser("generate")
     gen.add_argument("--checkpoint", type=Path, required=True)
